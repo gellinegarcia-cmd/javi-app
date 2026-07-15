@@ -95,6 +95,7 @@ export default function App() {
   }, [])
 
   const procesarAudio = useCallback(async (blob) => {
+    console.log('JAVI: procesarAudio llamado, blob.size:', blob.size)
     if (procesandoRef.current) return
     procesandoRef.current = true
     try {
@@ -172,11 +173,13 @@ export default function App() {
         : MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4'
 
       const grabarBloque = () => {
+        console.log('JAVI: grabarBloque iniciado')
         if (!grabando && mediaRef.current?.state !== 'recording') return
         chunksRef.current = []
         const mr = new MediaRecorder(stream, mimeType ? { mimeType } : {})
         mr.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data) }
         mr.onstop = async () => {
+          console.log('JAVI: mr.onstop disparado, chunks:', chunksRef.current.length)
           if (chunksRef.current.length > 0) {
             const blob = new Blob(chunksRef.current, { type: mimeType || 'audio/webm' })
             if (blob.size > 2000) await procesarAudio(blob)
