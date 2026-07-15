@@ -39,6 +39,12 @@ export default function App() {
   const [consultaTexto, setConsultaTexto] = useState('')
   const [respondiendo, setRespondiendo] = useState(false)
 
+  const grabandoRef = useRef(false)
+
+  useEffect(() => {
+    grabandoRef.current = grabando
+  }, [grabando])
+
   useEffect(() => {
     if (grabando) {
       setMensajes(prev => {
@@ -174,7 +180,7 @@ export default function App() {
 
       const grabarBloque = () => {
         console.log('JAVI: grabarBloque iniciado')
-        if (!grabando && mediaRef.current?.state !== 'recording') return
+        if (!grabandoRef.current && mediaRef.current?.state !== 'recording') return
         chunksRef.current = []
         const mr = new MediaRecorder(stream, mimeType ? { mimeType } : {})
         mr.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data) }
@@ -190,7 +196,7 @@ export default function App() {
         setTimeout(() => {
           if (mr.state === 'recording') {
             mr.stop()
-            setTimeout(grabarBloque, 500)
+            if (grabandoRef.current) setTimeout(grabarBloque, 500)
           }
         }, 30000)
       }
