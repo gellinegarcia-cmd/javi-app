@@ -1,3 +1,23 @@
 {
-  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }],
+  "headers": [
+    {
+      "source": "/(.*).wasm",
+      "headers": [
+        { "key": "Content-Type", "value": "application/wasm" }
+      ]
+    },
+    {
+      "source": "/(.*).onnx",
+      "headers": [
+        { "key": "Content-Type", "value": "application/octet-stream" }
+      ]
+    },
+    {
+      "source": "/(.*).mjs",
+      "headers": [
+        { "key": "Content-Type", "value": "application/javascript" }
+      ]
+    }
+  ]
 }
