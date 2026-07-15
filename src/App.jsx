@@ -39,6 +39,21 @@ export default function App() {
   const [consultaTexto, setConsultaTexto] = useState('')
   const [respondiendo, setRespondiendo] = useState(false)
 
+  useEffect(() => {
+    if (grabando) {
+      setMensajes(prev => {
+        const yaTiene = prev.some(m => m.tipo === 'sistema')
+        if (yaTiene) return prev
+        return [{
+          id: Date.now(),
+          tipo: 'sistema',
+          texto: 'Estoy escuchando tu guardia. Hablá con normalidad.',
+          hora: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })
+        }, ...prev]
+      })
+    }
+  }, [grabando])
+
   const mediaRef = useRef(null)
   const chunksRef = useRef([])
   const timerRef = useRef(null)
@@ -180,13 +195,6 @@ export default function App() {
       grabarBloque()
       setGrabando(true)
       timerRef.current = setInterval(() => setSegundos(s => s + 1), 1000)
-
-      setMensajes(prev => [{
-        id: Date.now(),
-        tipo: 'sistema',
-        texto: 'Estoy escuchando tu guardia. Podés hablar con normalidad.',
-        hora: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })
-      }, ...prev])
 
     } catch (e) {
       alert('Error al acceder al micrófono: ' + e.message)
