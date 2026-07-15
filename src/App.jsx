@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
+import { MicVAD } from '@ricky0123/vad-web'
 
 const API = 'https://kiosco-ai.onrender.com'
 
@@ -17,10 +18,6 @@ const S = {
   red: '#EF4444',
 }
 
-function fechaHoy() {
-  return new Date().toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit', year: 'numeric' })
-}
-
 function pad(n) { return String(n).padStart(2, '0') }
 function fmtTime(s) {
   return pad(Math.floor(s / 3600)) + ':' + pad(Math.floor(s % 3600 / 60)) + ':' + pad(s % 60)
@@ -34,49 +31,36 @@ export default function App() {
   const [pendientes, setPendientes] = useState(0)
   const [alertas, setAlertas] = useState(0)
   const [evoluciones, setEvoluciones] = useState(0)
-  const [tab, setTab] = useState('inicio')
-  const [consultaActiva, setConsultaActiva] = useState(false)
   const [consultaTexto, setConsultaTexto] = useState('')
   const [respondiendo, setRespondiendo] = useState(false)
+  const [consultaActiva, setConsultaActiva] = useState(false)
+  const [escuchando, setEscuchando] = useState(false)
+  const [modoConsulta, setModoConsulta] = useState(false)
 
-  const grabandoRef = useRef(false)
-
-  useEffect(() => {
-    grabandoRef.current = grabando
-  }, [grabando])
-
-  useEffect(() => {
-    if (grabando) {
-      setMensajes(prev => {
-        const yaTiene = prev.some(m => m.tipo === 'sistema')
-        if (yaTiene) return prev
-        return [{
-          id: Date.now(),
-          tipo: 'sistema',
-          texto: 'Estoy escuchando tu guardia. Hablá con normalidad.',
-          hora: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })
-        }, ...prev]
-      })
-    }
-  }, [grabando])
-
-  const mediaRef = useRef(null)
-  const chunksRef = useRef([])
+  const vadRef = useRef(null)
   const timerRef = useRef(null)
   const guardiaId = useRef('G' + Date.now().toString(36).toUpperCase())
-  const procesandoRef = useRef(false)
+  const grabandoRef = useRef(false)
+  const pacientesRef = useRef([])
+  const modoConsultaRef = useRef(false)
+  const bufferAudioRef = useRef([])
+
+  useEffect(() => { pacientesRef.current = pacientes }, [pacientes])
+  useEffect(() => { modoConsultaRef.current = modoConsulta }, [modoConsulta])
 
   useEffect(() => {
     const guardiaGuardada = localStorage.getItem('javi_guardia')
     if (guardiaGuardada) {
-      const g = JSON.parse(guardiaGuardada)
-      setSegundos(g.segundos || 0)
-      setPacientes(g.pacientes || [])
-      setMensajes(g.mensajes || [])
-      setPendientes(g.pendientes || 0)
-      setAlertas(g.alertas || 0)
-      setEvoluciones(g.evoluciones || 0)
-      guardiaId.current = g.id || guardiaId.current
+      try {
+        const g = JSON.parse(guardiaGuardada)
+        setSegundos(g.segundos || 0)
+        setPacientes(g.pacientes || [])
+        setMensajes(g.mensajes || [])
+        setPendientes(g.pendientes || 0)
+        setAlertas(g.alertas || 0)
+        setEvoluciones(g.evoluciones || 0)
+        guardiaId.current = g.id || guardiaId.current
+      } catch {}
     }
   }, [])
 
@@ -87,43 +71,68 @@ export default function App() {
     }))
   }, [segundos, pacientes, mensajes, pendientes, alertas, evoluciones])
 
+  useEffect(() => {
+    if (grabando) {
+      setMensajes(prev => {
+        if (prev.some(m => m.tipo === 'sistema')) return prev
+        return [{
+          id: Date.now(),
+          tipo: 'sistema',
+          texto: 'Estoy escuchando tu guardia. Hablá con normalidad.',
+          hora: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })
+        }, ...prev]
+      })
+    }
+  }, [grabando])
+
   const hablarConVoz = useCallback((texto) => {
     if (!window.speechSynthesis) return
     window.speechSynthesis.cancel()
     const u = new SpeechSynthesisUtterance(texto)
     u.lang = 'es-AR'
-    u.rate = 0.95
-    u.pitch = 1
+    u.rate = 0.92
+    u.pitch = 1.05
     const voces = window.speechSynthesis.getVoices()
-    const voz = voces.find(v => v.lang.startsWith('es')) || voces[0]
+    const voz = voces.find(v => v.lang.startsWith('es') && v.name.includes('Female'))
+      || voces.find(v => v.lang.startsWith('es'))
+      || voces[0]
     if (voz) u.voice = voz
     window.speechSynthesis.speak(u)
   }, [])
 
-  const procesarAudio = useCallback(async (blob) => {
-    console.log('JAVI: procesarAudio llamado, blob.size:', blob.size)
-    if (procesandoRef.current) return
-    procesandoRef.current = true
+  const procesarSegmento = useCallback(async (audioData, esConsulta = false) => {
     try {
-      const mimeType = blob.type || 'audio/webm'
-      const ext = mimeType.includes('mp4') ? 'audio.mp4' : 'audio.webm'
+      const float32 = audioData instanceof Float32Array ? audioData : new Float32Array(audioData)
+      const wavBlob = float32ToWav(float32, 16000)
+      if (wavBlob.size < 1000) return
+
       const fd = new FormData()
-      fd.append('audio', blob, ext)
+      fd.append('audio', wavBlob, 'segmento.wav')
       fd.append('guardia_id', guardiaId.current)
       fd.append('timestamp', new Date().toISOString())
 
       const resAudio = await fetch(`${API}/javi/audio`, { method: 'POST', body: fd })
       if (!resAudio.ok) return
-      const audioData = await resAudio.json()
-      if (!audioData.transcripcion || audioData.transcripcion.trim().length < 5) return
+      const audioDataRes = await resAudio.json()
+      const transcripcion = audioDataRes.transcripcion?.trim()
+      if (!transcripcion || transcripcion.length < 3) return
+
+      console.log('JAVI transcripción:', transcripcion)
+
+      const esWakeWord = /\bjavi\b/i.test(transcripcion)
+      if (esWakeWord || esConsulta || modoConsultaRef.current) {
+        const pregunta = transcripcion.replace(/\bjavi[,\s]*/i, '').trim()
+        if (pregunta.length > 3) await consultarJaviDirecto(pregunta)
+        return
+      }
 
       const resProcesar = await fetch(`${API}/javi/procesar`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          transcripcion: audioData.transcripcion,
+          transcripcion,
           guardia_id: guardiaId.current,
-          pacientes_actuales: pacientes,
+          pacientes_actuales: pacientesRef.current,
           timestamp: new Date().toISOString(),
         })
       })
@@ -135,11 +144,7 @@ export default function App() {
           const mapa = {}
           prev.forEach(p => mapa[p.id] = p)
           data.pacientes_detectados.forEach(p => {
-            if (mapa[p.id]) {
-              mapa[p.id] = { ...mapa[p.id], ...p }
-            } else {
-              mapa[p.id] = p
-            }
+            mapa[p.id] = mapa[p.id] ? { ...mapa[p.id], ...p } : p
           })
           return Object.values(mapa)
         })
@@ -154,106 +159,122 @@ export default function App() {
           hora: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })
         }
         setMensajes(prev => [nuevo, ...prev].slice(0, 10))
-        if (data.tipo_mensaje === 'importante') {
-          hablarConVoz(data.mensaje_javi)
-        }
+        if (data.tipo_mensaje === 'importante') hablarConVoz(data.mensaje_javi)
       }
 
       if (data.nuevos_pendientes) setPendientes(prev => prev + data.nuevos_pendientes)
       if (data.nuevas_alertas) setAlertas(prev => prev + data.nuevas_alertas)
 
     } catch (e) {
-      console.error('Error procesando audio:', e)
-    } finally {
-      procesandoRef.current = false
+      console.error('Error procesando segmento:', e)
     }
-  }, [pacientes, hablarConVoz])
+  }, [hablarConVoz])
 
-  const iniciarGrabacion = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 }
-      })
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4'
-
-      const grabarBloque = () => {
-        console.log('JAVI: grabarBloque iniciado')
-        if (!grabandoRef.current) return
-        chunksRef.current = []
-        const mr = new MediaRecorder(stream, mimeType ? { mimeType } : {})
-        mr.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data) }
-        mr.onstop = async () => {
-          console.log('JAVI: mr.onstop disparado, chunks:', chunksRef.current.length)
-          if (chunksRef.current.length > 0) {
-            const blob = new Blob(chunksRef.current, { type: mimeType || 'audio/webm' })
-            if (blob.size > 2000) await procesarAudio(blob)
-          }
-        }
-        mr.start()
-        mediaRef.current = mr
-        setTimeout(() => {
-          if (mr.state === 'recording') {
-            mr.stop()
-            if (grabandoRef.current) setTimeout(grabarBloque, 500)
-          }
-        }, 30000)
-      }
-
-      grabandoRef.current = true
-      setGrabando(true)
-      timerRef.current = setInterval(() => setSegundos(s => s + 1), 1000)
-      grabarBloque()
-
-    } catch (e) {
-      alert('Error al acceder al micrófono: ' + e.message)
-    }
-  }, [grabando, procesarAudio])
-
-  const detenerGrabacion = useCallback(() => {
-    if (mediaRef.current?.state === 'recording') {
-      mediaRef.current.stop()
-      mediaRef.current.stream?.getTracks().forEach(t => t.stop())
-    }
-    clearInterval(timerRef.current)
-    setGrabando(false)
-  }, [])
-
-  const consultarJavi = useCallback(async (texto) => {
-    if (!texto.trim() || respondiendo) return
+  const consultarJaviDirecto = useCallback(async (pregunta) => {
+    if (respondiendo) return
     setRespondiendo(true)
-    setConsultaTexto('')
+    hablarConVoz('Un momento...')
     try {
       const res = await fetch(`${API}/javi/consulta`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          pregunta: texto,
+          pregunta,
           guardia_id: guardiaId.current,
-          pacientes: pacientes,
-          timestamp: new Date().toISOString(),
+          pacientes: pacientesRef.current,
         })
       })
       const data = await res.json()
       if (data.respuesta) {
-        const nuevo = {
+        setMensajes(prev => [{
           id: Date.now(),
           tipo: 'respuesta',
-          pregunta: texto,
+          pregunta,
           texto: data.respuesta,
           hora: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })
-        }
-        setMensajes(prev => [nuevo, ...prev].slice(0, 10))
+        }, ...prev].slice(0, 10))
         hablarConVoz(data.respuesta)
       }
     } catch (e) {
       console.error('Error consultando:', e)
     }
     setRespondiendo(false)
-  }, [respondiendo, pacientes, hablarConVoz])
+  }, [respondiendo, hablarConVoz])
 
-  const grabarConsulta = useCallback(async () => {
+  function float32ToWav(samples, sampleRate) {
+    const buffer = new ArrayBuffer(44 + samples.length * 2)
+    const view = new DataView(buffer)
+    const writeStr = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)) }
+    writeStr(0, 'RIFF')
+    view.setUint32(4, 36 + samples.length * 2, true)
+    writeStr(8, 'WAVE')
+    writeStr(12, 'fmt ')
+    view.setUint32(16, 16, true)
+    view.setUint16(20, 1, true)
+    view.setUint16(22, 1, true)
+    view.setUint32(24, sampleRate, true)
+    view.setUint32(28, sampleRate * 2, true)
+    view.setUint16(32, 2, true)
+    view.setUint16(34, 16, true)
+    writeStr(36, 'data')
+    view.setUint32(40, samples.length * 2, true)
+    const vol = 0x7FFF
+    for (let i = 0; i < samples.length; i++) {
+      view.setInt16(44 + i * 2, Math.max(-1, Math.min(1, samples[i])) * vol, true)
+    }
+    return new Blob([buffer], { type: 'audio/wav' })
+  }
+
+  const iniciarGrabacion = useCallback(async () => {
+    try {
+      grabandoRef.current = true
+      setGrabando(true)
+      timerRef.current = setInterval(() => setSegundos(s => s + 1), 1000)
+
+      const vad = await MicVAD.new({
+        model: 'v5',
+        onSpeechStart: () => {
+          console.log('JAVI VAD: voz detectada')
+          setEscuchando(true)
+        },
+        onSpeechEnd: async (audio) => {
+          console.log('JAVI VAD: voz terminada, samples:', audio.length)
+          setEscuchando(false)
+          if (grabandoRef.current) await procesarSegmento(audio)
+        },
+        onVADMisfire: () => {
+          console.log('JAVI VAD: falso positivo descartado')
+          setEscuchando(false)
+        },
+        positiveSpeechThreshold: 0.8,
+        negativeSpeechThreshold: 0.3,
+        minSpeechFrames: 5,
+      })
+
+      await vad.start()
+      vadRef.current = vad
+
+    } catch (e) {
+      console.error('Error iniciando VAD:', e)
+      grabandoRef.current = false
+      setGrabando(false)
+      clearInterval(timerRef.current)
+      alert('Error al iniciar: ' + e.message)
+    }
+  }, [procesarSegmento])
+
+  const detenerGrabacion = useCallback(() => {
+    grabandoRef.current = false
+    if (vadRef.current) {
+      vadRef.current.pause()
+      vadRef.current = null
+    }
+    clearInterval(timerRef.current)
+    setGrabando(false)
+    setEscuchando(false)
+  }, [])
+
+  const consultarPorVoz = useCallback(async () => {
     setConsultaActiva(true)
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
@@ -269,52 +290,60 @@ export default function App() {
         fd.append('guardia_id', guardiaId.current)
         const res = await fetch(`${API}/javi/audio`, { method: 'POST', body: fd })
         const data = await res.json()
-        if (data.transcripcion) await consultarJavi(data.transcripcion)
+        if (data.transcripcion) await consultarJaviDirecto(data.transcripcion)
         setConsultaActiva(false)
       }
       mr.start()
       setTimeout(() => { if (mr.state === 'recording') mr.stop() }, 8000)
     } catch (e) {
       setConsultaActiva(false)
-      alert('Error micrófono')
     }
-  }, [consultarJavi])
+  }, [consultarJaviDirecto])
 
   const nuevaGuardia = () => {
-    if (!window.confirm('¿Iniciás una guardia nueva? Se perderán los datos actuales.')) return
+    if (!window.confirm('¿Iniciás guardia nueva? Se pierden los datos actuales.')) return
+    detenerGrabacion()
     localStorage.removeItem('javi_guardia')
-    setGrabando(false)
-    setSegundos(0)
-    setPacientes([])
-    setMensajes([])
-    setPendientes(0)
-    setAlertas(0)
-    setEvoluciones(0)
+    setSegundos(0); setPacientes([]); setMensajes([])
+    setPendientes(0); setAlertas(0); setEvoluciones(0)
     guardiaId.current = 'G' + Date.now().toString(36).toUpperCase()
   }
 
   return (
     <div style={{ background: S.bg, minHeight: '100vh', maxWidth: 390, margin: '0 auto', display: 'flex', flexDirection: 'column', fontFamily: '-apple-system,BlinkMacSystemFont,"SF Pro Text",Inter,sans-serif' }}>
+      <style>{`
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        input::placeholder { color: #8B949E; }
+        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+        @keyframes pulse { 0%{transform:scale(1);opacity:0.6} 100%{transform:scale(1.5);opacity:0} }
+      `}</style>
 
       <div style={{ padding: '14px 18px 0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <span style={{ fontSize: 11, color: S.dim }}>
           {new Date().toLocaleDateString('es-AR', { weekday: 'short', day: '2-digit', month: 'short' })}
         </span>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          {grabando && <div style={{ width: 7, height: 7, borderRadius: '50%', background: S.green, animation: 'blink 1.5s infinite' }} />}
-          <button onClick={nuevaGuardia} style={{ background: 'none', border: 'none', color: S.muted, cursor: 'pointer', fontSize: 12 }}>nueva guardia</button>
-        </div>
+        <button onClick={nuevaGuardia} style={{ background: 'none', border: 'none', color: S.muted, cursor: 'pointer', fontSize: 12 }}>
+          nueva guardia
+        </button>
       </div>
 
       <div style={{ padding: '14px 18px 12px', borderBottom: `0.5px solid ${S.border}` }}>
         <div style={{ fontSize: 10, color: S.dim, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 4 }}>Guardia activa</div>
-        <div style={{ fontSize: 22, fontWeight: 500, color: S.text, letterSpacing: '0.01em' }}>JAVI</div>
-        <div style={{ fontSize: 12, color: S.blue, marginTop: 2 }}>Tu compañero de guardia</div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ fontSize: 22, fontWeight: 500, color: S.text, letterSpacing: '0.01em' }}>JAVI</div>
+          {escuchando && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: S.blue }}>
+              <div style={{ width: 6, height: 6, borderRadius: '50%', background: S.blue, animation: 'blink 0.8s infinite' }} />
+              escuchando
+            </div>
+          )}
+        </div>
+        <div style={{ fontSize: 12, color: S.blue, marginTop: 2 }}>Tu compañero de guardia · 24hs con vos</div>
         <div style={{ marginTop: 12, background: S.surface, border: `0.5px solid ${S.border}`, borderRadius: 8, padding: '9px 13px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <div style={{ width: 7, height: 7, borderRadius: '50%', background: grabando ? S.green : S.dim, animation: grabando ? 'blink 1.5s infinite' : 'none' }} />
             <span style={{ fontSize: 13, color: grabando ? S.green : S.muted, fontWeight: 500 }}>
-              {grabando ? 'Grabando' : 'En pausa'}
+              {grabando ? (escuchando ? 'Detectando voz...' : 'En guardia') : 'Inactivo'}
             </span>
           </div>
           <span style={{ fontSize: 13, color: S.text, fontVariantNumeric: 'tabular-nums', fontWeight: 500 }}>
@@ -332,8 +361,7 @@ export default function App() {
         ].map((m, i) => (
           <div key={i} style={{ background: S.surface, border: `0.5px solid ${S.border}`, borderRadius: 10, padding: '12px 14px' }}>
             <div style={{ fontSize: 24, fontWeight: 500, color: m.color, marginBottom: 2, display: 'flex', alignItems: 'center', gap: 6 }}>
-              <span style={{ fontSize: 16 }}>{m.icon}</span>
-              {m.val}
+              <span style={{ fontSize: 16 }}>{m.icon}</span>{m.val}
             </div>
             <div style={{ fontSize: 11, color: S.muted }}>{m.lbl}</div>
           </div>
@@ -349,9 +377,7 @@ export default function App() {
               border: `0.5px solid ${m.tipo === 'respuesta' ? '#1D4ED8' : m.tipo === 'importante' ? '#B45309' : S.border}`,
               borderRadius: 10, padding: '10px 13px', marginBottom: 6
             }}>
-              {m.pregunta && (
-                <div style={{ fontSize: 11, color: S.muted, marginBottom: 4, fontStyle: 'italic' }}>"{m.pregunta}"</div>
-              )}
+              {m.pregunta && <div style={{ fontSize: 11, color: S.muted, marginBottom: 4, fontStyle: 'italic' }}>"{m.pregunta}"</div>}
               <div style={{ fontSize: 10, color: m.tipo === 'respuesta' ? S.blue : m.tipo === 'importante' ? S.amber : S.muted, fontWeight: 500, letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 3 }}>
                 {m.tipo === 'respuesta' ? 'Javi responde' : m.tipo === 'importante' ? 'Javi' : m.tipo === 'sistema' ? 'Sistema' : 'Clínico'} · {m.hora}
               </div>
@@ -363,17 +389,15 @@ export default function App() {
 
       {pacientes.length > 0 && (
         <div style={{ padding: '0 18px', marginBottom: 8 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-            <div style={{ fontSize: 10, color: S.muted, letterSpacing: '0.08em', textTransform: 'uppercase' }}>Pacientes detectados</div>
-          </div>
-          {pacientes.slice(0, 3).map((p, i) => (
-            <div key={p.id || i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 0', borderBottom: `0.5px solid ${S.border}` }}>
+          <div style={{ fontSize: 10, color: S.muted, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 8 }}>Pacientes detectados</div>
+          {pacientes.slice(0, 4).map((p, i) => (
+            <div key={p.id || i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 0', borderBottom: `0.5px solid ${S.border}` }}>
               <div style={{ width: 32, height: 32, borderRadius: 8, background: S.blueDark, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 600, color: S.text, flexShrink: 0 }}>
-                {p.cama || i + 1}
+                {p.cama || '?'}
               </div>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 13, fontWeight: 500, color: S.text }}>{p.nombre || 'Paciente ' + (i + 1)}</div>
-                <div style={{ fontSize: 11, color: S.muted, marginTop: 1 }}>{p.dx || 'Sin diagnóstico asignado'}</div>
+                <div style={{ fontSize: 13, fontWeight: 500, color: S.text }}>{p.nombre || 'Paciente detectado'}</div>
+                <div style={{ fontSize: 11, color: S.muted, marginTop: 1 }}>{p.dx || '—'}</div>
               </div>
               <span style={{ fontSize: 10, padding: '2px 8px', borderRadius: 99, background: p.estado === 'critico' ? 'rgba(239,68,68,0.1)' : p.estado === 'pendiente' ? 'rgba(245,158,11,0.1)' : 'rgba(34,197,94,0.1)', color: p.estado === 'critico' ? S.red : p.estado === 'pendiente' ? S.amber : S.green, border: `0.5px solid ${p.estado === 'critico' ? 'rgba(239,68,68,0.2)' : p.estado === 'pendiente' ? 'rgba(245,158,11,0.2)' : 'rgba(34,197,94,0.2)'}` }}>
                 {p.estado || 'estable'}
@@ -385,56 +409,56 @@ export default function App() {
 
       <div style={{ flex: 1 }} />
 
-      <div style={{ padding: '12px 18px', borderTop: `0.5px solid ${S.border}`, display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ padding: '10px 18px 8px', borderTop: `0.5px solid ${S.border}` }}>
+        <div style={{ fontSize: 11, color: S.dim, marginBottom: 6, textAlign: 'center' }}>
+          {grabando ? 'Decí "Javi" para hacer una consulta' : 'Iniciá la guardia para que Javi te escuche'}
+        </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <input
             value={consultaTexto}
             onChange={e => setConsultaTexto(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && consultarJavi(consultaTexto)}
-            placeholder="Preguntá algo a Javi..."
+            onKeyDown={e => e.key === 'Enter' && consultaTexto.trim() && consultarJaviDirecto(consultaTexto).then(() => setConsultaTexto(''))}
+            placeholder="Escribí una consulta a Javi..."
             style={{ flex: 1, background: S.surface, border: `0.5px solid ${S.border}`, borderRadius: 8, padding: '10px 12px', fontSize: 13, color: S.text, outline: 'none' }}
           />
           <button
-            onClick={() => consultaTexto.trim() ? consultarJavi(consultaTexto) : grabarConsulta()}
+            onClick={() => consultaTexto.trim() ? consultarJaviDirecto(consultaTexto).then(() => setConsultaTexto('')) : consultarPorVoz()}
             disabled={respondiendo}
-            style={{ width: 40, height: 40, borderRadius: 10, background: consultaActiva ? 'rgba(239,68,68,0.15)' : S.blue, border: 'none', color: '#fff', cursor: 'pointer', fontSize: 16, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            style={{ width: 40, height: 40, borderRadius: 10, background: consultaActiva ? 'rgba(239,68,68,0.2)' : S.blue, border: 'none', color: '#fff', cursor: 'pointer', fontSize: 16, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             {consultaActiva ? '⏹' : consultaTexto.trim() ? '↑' : '🎙'}
           </button>
         </div>
       </div>
 
       <div style={{ background: S.surface, borderTop: `0.5px solid ${S.border}`, padding: '10px 0 24px', display: 'flex', justifyContent: 'space-around', alignItems: 'center' }}>
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3, cursor: 'pointer' }} onClick={() => setTab('inicio')}>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3 }}>
           <span style={{ fontSize: 20 }}>🏠</span>
-          <span style={{ fontSize: 10, color: tab === 'inicio' ? S.blue : S.muted }}>Inicio</span>
+          <span style={{ fontSize: 10, color: S.blue }}>Inicio</span>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3, cursor: 'pointer' }} onClick={() => setTab('pacientes')}>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3 }}>
           <span style={{ fontSize: 20 }}>👥</span>
-          <span style={{ fontSize: 10, color: tab === 'pacientes' ? S.blue : S.muted }}>Pacientes</span>
+          <span style={{ fontSize: 10, color: S.muted }}>Pacientes</span>
         </div>
         <div style={{ marginTop: -14 }}>
           <button
             onClick={grabando ? detenerGrabacion : iniciarGrabacion}
-            style={{ width: 52, height: 52, borderRadius: '50%', background: grabando ? S.red : S.blue, border: 'none', color: '#fff', cursor: 'pointer', fontSize: 22, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            style={{ width: 56, height: 56, borderRadius: '50%', background: grabando ? S.red : S.blue, border: 'none', color: '#fff', cursor: 'pointer', fontSize: 24, display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative' }}>
             {grabando ? '⏸' : '🎙'}
+            {escuchando && (
+              <div style={{ position: 'absolute', inset: -4, borderRadius: '50%', border: `2px solid ${S.blue}`, animation: 'pulse 1s ease-out infinite', pointerEvents: 'none' }} />
+            )}
           </button>
         </div>
-        <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3, cursor: 'pointer' }} onClick={() => setTab('pendientes')}>
+        <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3 }}>
           {pendientes > 0 && <div style={{ position: 'absolute', top: -4, right: -4, width: 14, height: 14, borderRadius: '50%', background: S.red, color: '#fff', fontSize: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 600 }}>{pendientes}</div>}
           <span style={{ fontSize: 20 }}>⏰</span>
-          <span style={{ fontSize: 10, color: tab === 'pendientes' ? S.blue : S.muted }}>Pendientes</span>
+          <span style={{ fontSize: 10, color: S.muted }}>Pendientes</span>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3, cursor: 'pointer' }} onClick={() => setTab('mas')}>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3 }}>
           <span style={{ fontSize: 20 }}>···</span>
-          <span style={{ fontSize: 10, color: tab === 'mas' ? S.blue : S.muted }}>Más</span>
+          <span style={{ fontSize: 10, color: S.muted }}>Más</span>
         </div>
       </div>
-
-      <style>{`
-        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        input::placeholder { color: #8B949E; }
-      `}</style>
     </div>
   )
 }
