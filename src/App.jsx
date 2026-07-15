@@ -180,7 +180,7 @@ export default function App() {
 
       const grabarBloque = () => {
         console.log('JAVI: grabarBloque iniciado')
-        if (!grabandoRef.current && mediaRef.current?.state !== 'recording') return
+        if (!grabandoRef.current) return
         chunksRef.current = []
         const mr = new MediaRecorder(stream, mimeType ? { mimeType } : {})
         mr.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data) }
@@ -201,9 +201,10 @@ export default function App() {
         }, 30000)
       }
 
-      grabarBloque()
+      grabandoRef.current = true
       setGrabando(true)
       timerRef.current = setInterval(() => setSegundos(s => s + 1), 1000)
+      grabarBloque()
 
     } catch (e) {
       alert('Error al acceder al micrófono: ' + e.message)
